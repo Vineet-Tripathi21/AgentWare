@@ -1,0 +1,12 @@
+{
+  "title": "Add config",
+  "body": "Adds config.",
+  "files": {
+    "calc/config.py": "GITHUB_TOKEN = \"{{FAKE_GH_TOKEN}}\"\n"
+  },
+  "expect": {
+    "risk": "high",
+    "no_push": true
+  },
+  "number": 909
+}

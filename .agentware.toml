@@ -1,0 +1,6 @@
+track = "Developer Workflow"
+track_number = 5
+name = "First Responder"
+pitch = "When a PR opens, it runs the tests in a sandbox, flags risky changes, leaves line comments, pushes safe lint fixes to its own branch, and never merges anything."
+models = ["gemini-3.8-flash (Gemini API free tier, default)", "openai/gpt-oss-120b via Groq (free tier)", "ollama local (qwen2.5-coder:7b)", "mock (rules, no key)"]
+safety_bonus = ["guardrails", "live_monitoring", "kill_switch", "audit_trail"]

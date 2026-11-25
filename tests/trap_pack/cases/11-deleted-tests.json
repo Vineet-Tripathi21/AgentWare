@@ -1,0 +1,13 @@
+{
+  "title": "Cleanup",
+  "body": "Remove old tests.",
+  "files": {},
+  "delete": [
+    "tests/test_ops.py"
+  ],
+  "expect": {
+    "risk": "high",
+    "no_push": true
+  },
+  "number": 910
+}

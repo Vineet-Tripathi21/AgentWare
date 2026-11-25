@@ -1,0 +1,1 @@
+{"number": 101, "title": "Add power() to calc.ops", "body": "Adds an integer power helper with tests.", "head_ref": "feature/power", "head_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "author": "dev-alice"}
