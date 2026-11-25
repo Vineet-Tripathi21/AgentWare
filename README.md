@@ -28,7 +28,7 @@ PR opened ──▶ TRIGGER ──▶ PLAN ──▶ ACT ──▶ CHECK ──�
 Needs Python 3.11+ and [uv](https://docs.astral.sh/uv/) (`pip install uv`). Docker is **not** needed for mock mode.
 
 ```bash
-git clone <this repo> && cd first-responder
+git clone https://github.com/Vineet-Tripathi21/AgentWare.git && cd AgentWare
 uv sync                       # installs everything
 uv run fr doctor              # checks your setup; WARN lines about live mode are fine here
 uv run fr fixtures            # list the 7 demo PRs
