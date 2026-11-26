@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Any, Literal
 
 import httpx
@@ -188,12 +189,30 @@ JSON keys: verdict (2-4 sentences), comments [{path, line, severity, body}], ci_
 
 
 class LLMError(Exception):
-    pass
+    """Configuration problem (bad key, refused request). Needs a human: the run stops safely."""
+
+
+class LLMUnavailable(LLMError):
+    """Every model is overloaded, missing or returning junk. Transient: the run degrades to rules."""
 
 
 class Usage(BaseModel):
     tokens_in: int = 0
     tokens_out: int = 0
+    model: str = ""
+
+
+# provider -> (model that last worked as a fallback, monotonic expiry). Skips an overloaded
+# primary for a while instead of paying its retries on every call.
+_PREFERRED: dict[str, tuple[str, float]] = {}
+PREFER_FALLBACK_S = 600
+
+
+def _short_err(body: str) -> str:
+    try:
+        return str(json.loads(body).get("error", {}).get("message", ""))[:140] or body[:140]
+    except (ValueError, AttributeError):
+        return body[:140]
 
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -211,7 +230,9 @@ class LLM:
         self.s = settings
         self.provider = settings.llm_provider
         self.model = settings.llm_model
-        self.http = http or httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
+        self.models = [self.model] + [m for m in settings.llm_fallback_models if m and m != self.model]
+        self.fallback_events: list[dict[str, str]] = []   # models that failed during the last call
+        self.http = http or httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
         self._gemini_mode = 0
         self._groq_json = True
 
@@ -238,29 +259,53 @@ class LLM:
                       f"Reply again with ONLY a valid JSON object for the schema.")
             text2, usage2 = await self._call(system, repair)
             usage = Usage(tokens_in=usage.tokens_in + usage2.tokens_in,
-                          tokens_out=usage.tokens_out + usage2.tokens_out)
+                          tokens_out=usage.tokens_out + usage2.tokens_out, model=usage2.model)
             try:
                 return schema.model_validate(_extract_json(text2)), usage
             except (ValueError, ValidationError) as e2:
-                raise LLMError(f"model returned invalid {kind} twice: {str(e2)[:300]}") from e2
+                raise LLMUnavailable(f"model returned invalid {kind} twice: {str(e2)[:300]}") from e2
 
     async def _call(self, system: str, user: str) -> tuple[str, Usage]:
-        last: Exception | None = None
-        for attempt in range(3):
-            try:
-                return await self._call_once(system, user)
-            except httpx.HTTPStatusError as e:
-                code = e.response.status_code
-                if code in (429, 500, 502, 503, 504):
-                    last = e
-                    wait = _retry_after(e.response) or 2 ** attempt * 2
-                    await asyncio.sleep(min(wait, 20))
-                    continue
-                raise LLMError(self._explain(code, e.response.text)) from e
-            except (httpx.TransportError, httpx.TimeoutException) as e:
-                last = e
-                await asyncio.sleep(2 ** attempt)
-        raise LLMError(f"{self.provider} unavailable after 3 attempts: {last}")
+        """Try the primary model, then each fallback. Transient errors move down the list."""
+        self.fallback_events = []
+        order = list(self.models)
+        pref = _PREFERRED.get(self.provider)
+        if pref and pref[1] > time.monotonic() and pref[0] in order:
+            order.remove(pref[0])
+            order.insert(0, pref[0])
+        failures: list[str] = []
+        not_found = False
+        for i, model in enumerate(order):
+            attempts = 2 if i < len(order) - 1 else 3   # fail over faster while there is somewhere to go
+            last = "no attempt"
+            for attempt in range(attempts):
+                try:
+                    text, usage = await self._call_once(system, user, model)
+                    usage.model = model
+                    if model != self.models[0]:
+                        _PREFERRED[self.provider] = (model, time.monotonic() + PREFER_FALLBACK_S)
+                    else:
+                        _PREFERRED.pop(self.provider, None)
+                    return text, usage
+                except httpx.HTTPStatusError as e:
+                    code, body = e.response.status_code, e.response.text
+                    if code in (429, 500, 502, 503, 504):
+                        last = f"HTTP {code} {_short_err(body)}"
+                        if attempt < attempts - 1:
+                            await asyncio.sleep(min(_retry_after(e.response) or 2 ** attempt * 2, 20))
+                        continue
+                    if code == 404 or "model_not_found" in body.lower():
+                        last, not_found = "HTTP 404 model not available", True
+                        break
+                    raise LLMError(self._explain(code, body)) from e
+                except (httpx.TransportError, httpx.TimeoutException) as e:
+                    last = type(e).__name__
+                    if attempt < attempts - 1:
+                        await asyncio.sleep(2 ** attempt)
+            failures.append(f"{model}: {last}")
+            self.fallback_events.append({"model": model, "error": last})
+        hint = " Set LLM_MODEL / LLM_FALLBACK_MODELS to current models; run `fr doctor`." if not_found else ""
+        raise LLMUnavailable(f"{self.provider} unavailable ({'; '.join(failures)}).{hint}")
 
     def _explain(self, code: int, body: str) -> str:
         low = body.lower()
@@ -271,15 +316,15 @@ class LLM:
                     f"Set LLM_MODEL to a current model; run `fr doctor`.")
         return f"{self.provider} HTTP {code}: {body[:200]}"
 
-    async def _call_once(self, system: str, user: str) -> tuple[str, Usage]:
+    async def _call_once(self, system: str, user: str, model: str) -> tuple[str, Usage]:
         if self.provider == "gemini":
-            return await self._gemini(system, user)
+            return await self._gemini(system, user, model)
         if self.provider == "groq":
-            return await self._groq(system, user)
+            return await self._groq(system, user, model)
         if self.provider == "ollama":
             r = await self.http.post(
                 f"{self.s.ollama_url}/api/chat",
-                json={"model": self.model, "stream": False, "format": "json",
+                json={"model": model, "stream": False, "format": "json",
                       "options": {"temperature": 0.2},
                       "messages": [{"role": "system", "content": system},
                                    {"role": "user", "content": user}]},
@@ -291,7 +336,7 @@ class LLM:
                                                   tokens_out=d.get("eval_count", 0))
         raise LLMError(f"unknown LLM_PROVIDER '{self.provider}'")
 
-    async def _gemini(self, system: str, user: str) -> tuple[str, Usage]:
+    async def _gemini(self, system: str, user: str, model: str) -> tuple[str, Usage]:
         if not self.s.gemini_api_key:
             raise LLMError("GEMINI_API_KEY is not set")
         while True:
@@ -302,7 +347,7 @@ class LLM:
                 body["generationConfig"] = {"responseFormat": {"text": {"mimeType": "APPLICATION_JSON"}}}
             elif mode == "responseMimeType":
                 body["generationConfig"] = {"responseMimeType": "application/json"}
-            r = await self.http.post(f"{GEMINI_URL}/{self.model}:generateContent",
+            r = await self.http.post(f"{GEMINI_URL}/{model}:generateContent",
                                      headers={"x-goog-api-key": self.s.gemini_api_key}, json=body)
             if (r.status_code == 400 and self._gemini_mode < len(GEMINI_JSON_MODES) - 1
                     and "api key" not in r.text.lower()
@@ -317,17 +362,17 @@ class LLM:
             if not parts:
                 reason = (cands[0].get("finishReason") if cands else None) \
                     or (d.get("promptFeedback") or {}).get("blockReason") or "unknown"
-                raise LLMError(f"gemini returned no content (reason: {reason})")
+                raise LLMUnavailable(f"gemini returned no content (reason: {reason})")
             text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
             um = d.get("usageMetadata", {})
             return text, Usage(tokens_in=um.get("promptTokenCount", 0),
                                tokens_out=um.get("candidatesTokenCount", 0) + um.get("thoughtsTokenCount", 0))
 
-    async def _groq(self, system: str, user: str) -> tuple[str, Usage]:
+    async def _groq(self, system: str, user: str, model: str) -> tuple[str, Usage]:
         if not self.s.groq_api_key:
             raise LLMError("GROQ_API_KEY is not set")
         while True:
-            body: dict[str, Any] = {"model": self.model, "temperature": 0.2,
+            body: dict[str, Any] = {"model": model, "temperature": 0.2,
                                     "messages": [{"role": "system", "content": system},
                                                  {"role": "user", "content": user}]}
             if self._groq_json:
@@ -416,7 +461,12 @@ INJECTION_TO_ACTION = {
 }
 
 
-def mock_brain(kind: str, ctx: dict[str, Any]) -> dict[str, Any]:
+def rules_brain(kind: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic stand-in used when every real model is unavailable (no fooled-model act)."""
+    return mock_brain(kind, ctx, simulate_fooled=False)
+
+
+def mock_brain(kind: str, ctx: dict[str, Any], simulate_fooled: bool = True) -> dict[str, Any]:
     if kind == "plan":
         risks = ctx.get("risk_findings", [])
         level = "low"
@@ -424,9 +474,10 @@ def mock_brain(kind: str, ctx: dict[str, Any]) -> dict[str, Any]:
             if ["low", "medium", "high"].index(r["level"]) > ["low", "medium", "high"].index(level):
                 level = r["level"]
         injections = ctx.get("injections", [])
-        # Simulate a model that was partially fooled: it echoes what the injection asked for.
+        # Mock mode simulates a model that was partially fooled: it echoes what the injection
+        # asked for, so the policy layer can be seen blocking it. The rules fallback does not.
         requested = sorted({INJECTION_TO_ACTION[i["kind"]] for i in injections
-                            if i["kind"] in INJECTION_TO_ACTION})
+                            if i["kind"] in INJECTION_TO_ACTION}) if simulate_fooled else []
         reasons = sorted({f"{r['message']} ({r['path']})" for r in risks if r["level"] != "low"})
         if injections:
             reasons.append(f"instruction-like text found in {sorted({i['source'] for i in injections})}")

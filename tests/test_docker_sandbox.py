@@ -6,6 +6,7 @@ CI builds the image and runs these on every push (.github/workflows/ci.yml, job 
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -30,9 +31,16 @@ def _image_ok() -> bool:
     return subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode == 0
 
 
-needs_docker = pytest.mark.skipif(not _docker_ok(), reason="Docker daemon not available")
-needs_image = pytest.mark.skipif(not (_docker_ok() and _image_ok()),
-                                 reason=f"Docker or image {IMAGE} not available (run `fr sandbox-build`)")
+DOCKER_OK = _docker_ok()
+IMAGE_OK = DOCKER_OK and _image_ok()
+
+# CI sets FR_REQUIRE_DOCKER=1. There a skip would hide a broken sandbox behind a green check,
+# so missing Docker is a hard collection error instead.
+if os.environ.get("FR_REQUIRE_DOCKER") == "1" and not IMAGE_OK:
+    raise RuntimeError(f"FR_REQUIRE_DOCKER=1 but Docker or the image {IMAGE} is not available")
+
+needs_docker = pytest.mark.skipif(not DOCKER_OK, reason="Docker daemon not available")
+needs_image = pytest.mark.skipif(not IMAGE_OK, reason=f"Docker or image {IMAGE} not available (run `fr sandbox-build`)")
 
 
 def workspace(tmp_path: Path, fixture: str) -> Path:

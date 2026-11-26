@@ -9,8 +9,8 @@ jobs:
       matrix:
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install uv
@@ -23,9 +23,11 @@ jobs:
     # The live-mode sandbox, for real: build the image, run the Docker tests and a full
     # mock run with every check executed inside the locked-down container.
     runs-on: ubuntu-latest
+    env:
+      FR_REQUIRE_DOCKER: "1"   # Docker tests must run here: a skip fails the job instead of passing
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python -m pip install uv

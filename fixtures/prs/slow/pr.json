@@ -1,1 +1,1 @@
-{"number": 105, "title": "Add integration test against the slow pricing service", "body": "Adds an end-to-end test. It takes a while.", "head_ref": "test/integration", "head_sha": "e5f60718293a4b5c6d7e8f9012345678a1b2c3d4", "author": "dev-dan"}
+{"number": 105, "title": "Add integration test against the slow pricing service", "body": "Adds an end-to-end test. It takes a while.", "head_ref": "test/integration", "head_sha": "e5f60718293a4b5c6d7e8f9012345678a1b2c3d4", "author": "dev-dan", "demo": "45-second test suite: press the kill switch mid-run"}

@@ -7,16 +7,26 @@ from dataclasses import replace
 import httpx
 import pytest
 
+import fr.llm
 from fr.config import Settings
-from fr.llm import LLM, LLMError, Plan
+from fr.llm import LLM, LLMError, LLMUnavailable, Plan
 
 PLAN = {"summary": "s", "risk": "low", "checks": ["test"], "autofix": False}
+HIGH_DEMAND = {"error": {"code": 503, "message": "This model is currently experiencing high demand."}}
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch):
+    monkeypatch.setattr(fr.llm, "_PREFERRED", {})  # no remembered fallback leaks between tests
+
+    async def nosleep(_):
+        return None
+    monkeypatch.setattr("fr.llm.asyncio.sleep", nosleep)
 
 
 def make(provider, handler, **kw):
-    s = replace(Settings(), llm_provider=provider, llm_model="m", gemini_api_key="k",
-                groq_api_key="k", **kw)
-    return LLM(s, http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    opts = {"llm_provider": provider, "llm_model": "m", "gemini_api_key": "k", "groq_api_key": "k", **kw}
+    return LLM(replace(Settings(), **opts), http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
 
 
 def gemini_body(obj, tin=10, tout=5):
@@ -135,6 +145,56 @@ def test_groq_drops_json_mode_if_unsupported():
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(PLAN)}}]})
     out, _ = asyncio.run(make("groq", h).complete("plan", "s", "u", {}))
     assert out.risk == "low" and calls == [True, False]
+
+
+def test_overloaded_model_falls_back_and_is_remembered():
+    seen = []
+
+    def h(req):
+        model = req.url.path.rsplit("/", 1)[-1].split(":")[0]
+        seen.append(model)
+        return httpx.Response(503, json=HIGH_DEMAND) if model == "primary" else httpx.Response(200, json=gemini_body(PLAN))
+    llm = make("gemini", h, llm_model="primary", llm_fallback_models=["backup"])
+    llm.models = ["primary", "backup"]
+    out, usage = asyncio.run(llm.complete("plan", "s", "u", {}))
+    assert out.risk == "low" and usage.model == "backup"
+    assert seen == ["primary", "primary", "backup"], "2 tries on the main model, then the fallback"
+    assert llm.fallback_events[0]["model"] == "primary" and "high demand" in llm.fallback_events[0]["error"]
+    seen.clear()
+    asyncio.run(llm.complete("plan", "s", "u", {}))
+    assert seen == ["backup"], "the working fallback is remembered; the overloaded model is skipped"
+
+
+def test_retired_model_404_falls_back():
+    def h(req):
+        if "/old:" in req.url.path:
+            return httpx.Response(404, json={"error": {"message": "models/old is not found"}})
+        return httpx.Response(200, json=gemini_body(PLAN))
+    llm = make("gemini", h, llm_model="old")
+    llm.models = ["old", "new"]
+    _, usage = asyncio.run(llm.complete("plan", "s", "u", {}))
+    assert usage.model == "new"
+
+
+def test_bad_key_never_falls_back():
+    calls = []
+
+    def h(req):
+        calls.append(req.url.path)
+        return httpx.Response(400, json={"error": {"message": "API key not valid. Please pass a valid API key."}})
+    llm = make("gemini", h, llm_model="primary")
+    llm.models = ["primary", "backup"]
+    with pytest.raises(LLMError) as ei:
+        asyncio.run(llm.complete("plan", "s", "u", {}))
+    assert not isinstance(ei.value, LLMUnavailable), "a config error must stop the run, not degrade"
+    assert len(calls) == 1 and "API key" in str(ei.value)
+
+
+def test_every_model_down_is_unavailable():
+    llm = make("gemini", lambda r: httpx.Response(503, json=HIGH_DEMAND), llm_model="a")
+    llm.models = ["a", "b"]
+    with pytest.raises(LLMUnavailable, match="high demand"):
+        asyncio.run(llm.complete("plan", "s", "u", {}))
 
 
 def test_default_models_are_current(monkeypatch):

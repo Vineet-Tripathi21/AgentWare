@@ -48,6 +48,7 @@ class Settings:
     ollama_url: str = "http://localhost:11434"
     price_in_per_mtok: float = 0.0  # USD per 1M input tokens (0 on free tiers)
     price_out_per_mtok: float = 0.0
+    llm_fallback_models: list[str] = field(default_factory=list)  # tried in order if the main one is down
 
     # GitHub
     github_token: str = ""
@@ -87,9 +88,15 @@ class Settings:
             "ollama": "qwen2.5-coder:7b",
             "mock": "rules-v1",
         }
+        default_fallbacks = {  # free-tier alternatives, tried when the main model is overloaded or retired
+            "gemini": "gemini-3.6-flash,gemini-3.5-flash-lite",
+            "groq": "openai/gpt-oss-20b",
+        }
+        fb = e("LLM_FALLBACK_MODELS", default_fallbacks.get(provider, ""))
         s = cls(
             llm_provider=provider,
             llm_model=e("LLM_MODEL") or default_models.get(provider, ""),
+            llm_fallback_models=[] if fb.strip().lower() == "none" else [m.strip() for m in fb.split(",") if m.strip()],
             gemini_api_key=e("GEMINI_API_KEY", ""),
             groq_api_key=e("GROQ_API_KEY", ""),
             ollama_url=e("OLLAMA_URL", "http://localhost:11434"),

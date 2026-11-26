@@ -247,6 +247,21 @@ def test_live_push_failure_does_not_lose_the_review(world, settings, monkeypatch
     assert "fr:autofix-pushed" not in api.labels[102]
 
 
+def test_can_push_probe_writes_nothing(world, tmp_path):
+    api, bare, make_gh = world
+    before = git("for-each-ref", cwd=bare)
+    gh = make_gh()
+    ok, detail = asyncio.run(gh.can_push())
+    asyncio.run(gh.aclose())
+    assert ok, detail
+    assert git("for-each-ref", cwd=bare) == before, "a dry-run probe must not create any ref"
+    bad = GitHub("t", REPO, http=httpx.AsyncClient(transport=httpx.MockTransport(api.handler)),
+                 clone_base=(tmp_path / "does-not-exist").as_posix())
+    ok, detail = asyncio.run(bad.can_push())
+    asyncio.run(bad.aclose())
+    assert not ok and "push" in detail
+
+
 def test_seed_sets_up_an_empty_repo_and_opens_prs(tmp_path, settings, monkeypatch):
     async def no_sleep(_):
         return None

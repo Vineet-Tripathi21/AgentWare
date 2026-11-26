@@ -120,10 +120,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/state")
     async def state():
-        fixtures = sorted(p.name for p in (FIXTURES / "prs").iterdir() if p.is_dir()) \
-            if (FIXTURES / "prs").exists() else []
         return {"killed": svc.ks.engaged, "kill_reason": svc.ks.reason, "current": svc.current,
-                "queue": svc.queue.qsize(), "recent": svc.recent[:10], "fixtures": fixtures,
+                "queue": svc.queue.qsize(), "recent": svc.recent[:10], "fixtures": list_fixtures(),
                 "live_configured": bool(settings.github_token and settings.github_repo),
                 "repo": settings.github_repo, "llm": f"{settings.llm_provider}:{settings.llm_model}",
                 "sandbox": f"live: {settings.sandbox} · mock: {settings.mock_sandbox}"}
@@ -175,8 +173,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         body = await _json(request)
         if not (settings.github_token and settings.github_repo):
             raise HTTPException(400, "live mode not configured (GITHUB_TOKEN / GITHUB_REPO)")
-        return await svc.enqueue({"kind": "live", "pr": int(body["pr"]),
-                                  "force": bool(body.get("force"))})
+        try:
+            pr = int(body.get("pr"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "give a pull request number") from None
+        if pr < 1:
+            raise HTTPException(400, "give a pull request number")
+        return await svc.enqueue({"kind": "live", "pr": pr, "force": bool(body.get("force"))})
 
     @app.post("/webhook")
     async def webhook(request: Request):
@@ -204,8 +207,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/traces")
     async def traces():
-        files = sorted(settings.traces_dir.glob("*.jsonl"), reverse=True)[:50]
+        files = sorted(settings.traces_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)[:50]
         return [{"id": f.stem, "bytes": f.stat().st_size} for f in files]
+
+    @app.get("/api/runs")
+    async def runs(limit: int = 30):
+        """Recorded runs, newest first, summarised from their traces (the dashboard's history)."""
+        files = sorted(settings.traces_dir.glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+        return [s for s in (summarize_trace(f) for f in files[:max(1, min(limit, 200))]) if s]
 
     @app.get("/api/traces/{run_id}")
     async def trace(run_id: str):
@@ -216,6 +225,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse({"verified": ok, "message": msg, "events": read_trace(p)})
 
     return app
+
+
+def list_fixtures() -> list[dict[str, Any]]:
+    out = []
+    base = FIXTURES / "prs"
+    for d in sorted(base.iterdir()) if base.exists() else []:
+        try:
+            meta = json.loads((d / "pr.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        out.append({"name": d.name, "number": meta.get("number"), "title": meta.get("title", ""),
+                    "demo": meta.get("demo", "")})
+    return out
+
+
+def summarize_trace(path: Path) -> dict[str, Any] | None:
+    try:
+        events = read_trace(path)
+    except (OSError, ValueError):
+        return None
+    if not events:
+        return None
+    s: dict[str, Any] = {"id": path.stem, "trap": path.stem.startswith("trap-"), "events": len(events),
+                         "status": "RUNNING", "risk": None, "title": "", "injections": 0}
+    for ev in events:
+        d = ev.get("data", {})
+        t = ev.get("type")
+        if t == "run_started":
+            s.update(pr=d.get("pr"), mode=d.get("mode"), llm=d.get("llm"), started=ev.get("ts"))
+        elif t == "tool_result" and d.get("tool") == "get_pr" and isinstance(d.get("result"), dict):
+            s["title"] = d["result"].get("title", "")
+        elif t == "injection_detected":
+            s["injections"] += 1
+        elif t == "run_finished":
+            s.update(status=d.get("status"), risk=d.get("risk"), writes=len(d.get("executed") or []),
+                     blocked=len(d.get("blocked") or []), elapsed_s=(d.get("budget") or {}).get("elapsed_s"))
+    return s
 
 
 async def _json(request: Request) -> dict[str, Any]:

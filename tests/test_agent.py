@@ -122,6 +122,24 @@ def test_llm_failure_fails_safe(make_agent, monkeypatch):
     assert [a["action"] for a in gh.actions] == ["upsert_summary"]
 
 
+def test_model_outage_degrades_to_rules_and_says_so(make_agent, monkeypatch):
+    from fr.llm import LLMUnavailable
+    agent, gh, _ = make_agent("risky")
+
+    async def overloaded(*a, **k):
+        raise LLMUnavailable("gemini unavailable (gemini-3.8-flash: HTTP 503 high demand)")
+    monkeypatch.setattr(agent.llm, "complete", overloaded)
+    res = run(agent)
+    assert res.status == "DONE" and res.degraded and res.risk == "high", "the job still gets done"
+    labels = next(a for a in gh.actions if a["action"] == "add_labels")["labels"]
+    assert "fr:rules-only" in labels
+    summary = next(a for a in gh.actions if a["action"] == "upsert_summary")["body"]
+    assert "model was unavailable" in summary
+    review = next(a for a in gh.actions if a["action"] == "post_review")
+    assert any("credential" in c["body"].lower() for c in review["comments"]), "rules still catch the risk"
+    assert not res.blocked, "the rules fallback never 'requests' forbidden actions"
+
+
 def test_agent_branch_prs_are_skipped(make_agent):
     agent, gh, _ = make_agent("clean")
     gh.meta["head_ref"] = "agent/fix-1-abc"

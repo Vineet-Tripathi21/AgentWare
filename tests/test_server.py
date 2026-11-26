@@ -87,8 +87,26 @@ def test_kill_and_resume_endpoints(client, settings):
 
 def test_state_lists_fixtures_and_dashboard_loads(client):
     state = client.get("/api/state").json()
-    assert {"clean", "hostile", "slow"} <= set(state["fixtures"])
+    names = {f["name"] for f in state["fixtures"]}
+    assert {"clean", "hostile", "slow"} <= names
+    assert all(f["demo"] and f["number"] for f in state["fixtures"]), "every demo PR explains itself"
     assert "KILL SWITCH" in client.get("/").text
+
+
+def test_run_history_summarises_traces(client, settings, make_agent):
+    import asyncio
+    agent, _, _ = make_agent("hostile")
+    asyncio.run(agent.run(None))
+    runs = client.get("/api/runs").json()
+    assert runs and runs[0]["status"] == "DONE" and runs[0]["risk"] == "high"
+    assert runs[0]["title"] == "Docs: add usage examples" and runs[0]["blocked"] >= 3
+    trace = client.get(f"/api/traces/{runs[0]['id']}").json()
+    assert trace["verified"] is True and trace["events"][-1]["type"] == "run_finished"
+
+
+@pytest.mark.parametrize("body", [{}, {"pr": "abc"}, {"pr": 0}, {"pr": None}])
+def test_live_run_rejects_bad_pr_numbers(client, body):
+    assert client.post("/api/runs/live", json=body).status_code == 400
 
 
 def test_unknown_trace_is_404_and_path_traversal_is_contained(client):

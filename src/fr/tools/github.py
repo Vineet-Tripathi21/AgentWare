@@ -175,8 +175,33 @@ class GitHub:
             raise
         text = out.decode("utf-8", "replace")
         if proc.returncode and check:
-            raise GitHubError(f"git {args[0]} failed: {text[-300:]}")
+            hint = ""
+            if args and args[0] == "push" and ("403" in text or "denied" in text.lower()):
+                hint = (" | The token cannot write to this repo. Edit the fine-grained token: Repository access"
+                        " = 'Only select repositories' -> this repo; Contents, Pull requests, Issues ="
+                        " 'Read and write'. Then run `fr doctor`.")
+            raise GitHubError(f"git {args[0]} failed: {text[-300:]}{hint}")
         return text
+
+    async def can_push(self) -> tuple[bool, str]:
+        """Prove write access without writing: a dry-run push asks GitHub for push rights only."""
+        probe = Path(tempfile.mkdtemp(prefix="fr-probe-"))
+        try:
+            await self._git("init", "-q", str(probe))
+            await self._git("commit", "-q", "--allow-empty", "-m", "fr doctor probe", cwd=probe)
+            try:
+                await self._git("push", "--dry-run", "-q", self.clone_url,
+                                "HEAD:refs/heads/fr-doctor-probe", cwd=probe)
+                return True, "token can push (checked with a dry run; nothing was written)"
+            except GitHubError as e:
+                msg = str(e)
+                if "403" in msg or "denied" in msg.lower():
+                    return False, ("token is read-only for this repo (HTTP 403). Edit the token: Repository access ="
+                                   " 'Only select repositories' -> this repo; Contents, Pull requests, Issues ="
+                                   " 'Read and write'")
+                return False, msg[:300]
+        finally:
+            _rmtree(probe)
 
     async def checkout(self, pr: PullRequest) -> Path:
         ws = Path(tempfile.mkdtemp(prefix=f"fr-pr{pr.number}-"))

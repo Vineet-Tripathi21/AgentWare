@@ -18,7 +18,13 @@ Every tool call passes `Policy.gate(tool, args)` before it runs (`runner.Agent._
 
 ## 2. Live monitoring: `fr serve` → http://127.0.0.1:8787
 
-A real-time stream (SSE) of every event: current phase (TRIGGER→REPORT), each tool call with tier and arguments, results and latency, model outputs, decisions with their reasons, blocked actions, injection hits, checks, writes performed, and **tool calls / LLM calls / tokens / cost / elapsed time** updating live. `fr run` shows the same timeline in the terminal.
+A real-time view (Server-Sent Events) of what the agent is doing and why:
+- **Header:** run status, the 5-phase stepper (Read PR → Plan → Check & review → Verify fix → Report), and live **tool calls / model calls / tokens / cost so far / elapsed**.
+- **Timeline:** one plain-English row per step. Each tool call shows a spinner while running, then ✓/✗ with its duration and READ/WRITE tier. Decisions show their reason, and raw details expand. Filters: Actions · Decisions · Safety · Errors.
+- **Outcome panel:** writes performed, actions blocked by policy (and who asked for them), injection hits, risk level with the reasons, checks run in the sandbox, and the hard limits.
+- **Run history:** any past run replays from its trace with the hash chain re-verified (`✓ log intact`). Shareable links: `/?run=<id>`, `&filter=safety`.
+
+`fr run` shows the same timeline in the terminal.
 
 ## 3. Kill switch: `src/fr/killswitch.py`
 

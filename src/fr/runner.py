@@ -19,7 +19,7 @@ from . import diffparse, injection, risk
 from .audit import BUS, AuditLog, EventBus
 from .config import Settings
 from .killswitch import Killed, KillSwitch
-from .llm import LLM, PLAN_SYSTEM, REVIEW_SYSTEM, LLMError, Plan, Review
+from .llm import LLM, PLAN_SYSTEM, REVIEW_SYSTEM, SCHEMAS, LLMError, LLMUnavailable, Plan, Review, rules_brain
 from .policy import TOOLS, Budget, BudgetExceeded, Decision, Policy, redact
 from .store import Store
 from .tools.github import GitHubError, PullRequest
@@ -41,6 +41,7 @@ class RunResult:
     error: str | None = None
     trace: str = ""
     budget: dict[str, Any] = field(default_factory=dict)
+    degraded: bool = False   # True when the model was unavailable and rules did a step instead
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -111,16 +112,35 @@ class Agent:
     async def _ask(self, kind: str, system: str, user: str, ctx: dict[str, Any]):
         async def go():
             return await self.llm.complete(kind, system, user, ctx)
-        out = await self._tool("llm", {"kind": kind, "model": self.llm.describe(),
-                                       "prompt_chars": len(user)}, go,
-                               lambda r: {"tokens_in": r[1].tokens_in, "tokens_out": r[1].tokens_out})
+        try:
+            out = await self._tool("llm", {"kind": kind, "model": self.llm.describe(),
+                                           "prompt_chars": len(user)}, go,
+                                   lambda r: {"tokens_in": r[1].tokens_in, "tokens_out": r[1].tokens_out,
+                                              "model": r[1].model or self.llm.model})
+        except LLMUnavailable as e:
+            # Every model is overloaded/missing/returning junk. Do the step with deterministic rules
+            # instead of abandoning the review; say so on the PR. Config errors still stop the run.
+            self.degraded = self.result.degraded = True
+            self.audit.log("decision", self.phase, what=f"model unavailable: the {kind} uses deterministic rules",
+                           why=str(e)[:400])
+            model_out = SCHEMAS[kind].model_validate(rules_brain(kind, ctx))
+            self.models_used.append("rules (model unavailable)")
+            self.audit.log("model_output", self.phase, kind=kind, output=model_out.model_dump(),
+                           model="rules (model unavailable)", cost_usd=round(self.budget.cost_usd, 6))
+            return model_out
         model_out, usage = out
+        if self.llm.fallback_events or (usage.model and usage.model != self.llm.model):
+            skipped = ", ".join(f"{f['model']} ({f['error'][:60]})" for f in self.llm.fallback_events) \
+                or f"{self.llm.model} (unavailable on a recent call)"
+            self.audit.log("decision", self.phase, what=f"answered by fallback model {usage.model}",
+                           why=f"main model skipped: {skipped}")
         self.budget.llm_calls += 1
         self.budget.tokens_in += usage.tokens_in
         self.budget.tokens_out += usage.tokens_out
         self.budget.cost_usd += self.llm.cost(usage)
+        self.models_used.append(usage.model or self.llm.model)
         self.audit.log("model_output", self.phase, kind=kind, output=model_out.model_dump(),
-                       cost_usd=round(self.budget.cost_usd, 6))
+                       model=usage.model, cost_usd=round(self.budget.cost_usd, 6))
         return model_out
 
     # ------------------------------------------------------------ main
@@ -136,6 +156,8 @@ class Agent:
         self.phase = "TRIGGER"
         self.pr: PullRequest | None = None
         self._ws: Path | None = None
+        self.degraded = False
+        self.models_used: list[str] = []   # which model actually answered each step (fallbacks included)
         self.audit.log("run_started", "TRIGGER", pr=pr_number, repo=getattr(self.gh, "repo", ""),
                        mode=getattr(self.gh, "mode", "?"), llm=self.llm.describe(),
                        sandbox=self.backend, budgets={
@@ -181,7 +203,7 @@ class Agent:
         self.audit.log("run_finished", self.phase, status=self.result.status,
                        risk=self.result.risk, executed=self.result.executed,
                        blocked=self.result.blocked, error=self.result.error,
-                       budget=self.result.budget)
+                       budget=self.result.budget, degraded=self.result.degraded)
         if self.store and self.pr and self.result.status in {"DONE", "NEEDS_HUMAN"}:
             self.store.record(self._key, self.run_id, self.result.status)
         return self.result
@@ -348,6 +370,8 @@ class Agent:
             labels.append("fr:autofix-pushed")
         if question:
             labels.append("fr:needs-human")
+        if self.degraded:
+            labels.append("fr:rules-only")
         await self._tool("add_labels", {"labels": labels},
                          lambda: self.gh.add_labels(pr.number, labels))
         verdict = redact(review.verdict) or "No review notes."
@@ -423,6 +447,10 @@ class Agent:
             return f"⚠️ {v.note}" if v.note else "❌ fail"
         rows = "\n".join(f"| `{k}` | {status(v)} | {v.duration_s}s |" for k, v in results.items())
         parts = [f"## {icon} First Responder: {level} risk", ""]
+        if self.degraded:
+            parts += ["> **⚠️ The model was unavailable** (provider overloaded or down), so part of this review "
+                      "uses deterministic rules only. Tests, lint, risk rules and the injection scanner ran "
+                      "normally. Re-run later for a full model review.", ""]
         if question:
             parts += [f"> **🛑 Needs a human:** {question}", ">",
                       "> I ran the safe checks below but made no code changes.", ""]
@@ -434,7 +462,8 @@ class Agent:
                   f"- ran {', '.join(results)} in an isolated sandbox",
                   f"- left {len(comments)} line comment(s)"]
         if fix_url:
-            parts.append(f"- pushed mechanical lint fixes to [{fix_url.rsplit('/', 1)[-1]}]({fix_url}) "
+            branch = fix_url.split("/tree/", 1)[-1]
+            parts.append(f"- pushed mechanical lint fixes to [`{branch}`]({fix_url}) "
                          "(tests pass on it). Merge it yourself if you want it.")
         if self.result.blocked:
             parts += ["", "**What I refused to do**"]
@@ -444,7 +473,10 @@ class Agent:
             parts += [f"- `{i['kind']}` in {i['source']}: \"{i['excerpt'][:90]}\""
                       for i in self.result.injections[:6]]
         b = self.budget.snapshot()
-        parts += ["", f"<sub>run `{self.run_id}` · model `{self.llm.describe()}` · "
+        used = list(dict.fromkeys(self.models_used)) or [self.llm.model]
+        primary = self.llm.model
+        model_txt = ", ".join(f"`{m}`" + ("" if m == primary or m.startswith("rules") else " (fallback)") for m in used)
+        parts += ["", f"<sub>run `{self.run_id}` · answered by {model_txt} · "
                       f"{b['llm_calls']} model calls · {b['tokens_in']}+{b['tokens_out']} tokens · "
                       f"${b['cost_usd']:.4f} · {b['elapsed_s']}s · I never merge, approve, or push to "
                       f"the default branch.</sub>"]

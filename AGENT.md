@@ -61,7 +61,9 @@ GitHub token scope needed: one repository; Contents R/W, Pull requests R/W, Issu
 | failure | behaviour |
 |---|---|
 | GitHub 429/5xx/network | 4 tries with backoff, honouring `Retry-After`, then `FAILED_SAFE` + summary comment |
-| model 429/5xx/network | 3 tries with backoff, then `FAILED_SAFE` |
+| model overloaded (429/5xx), timed out, or retired (404) | retries with backoff, then **falls back** to the next free model (`gemini-3.6-flash` → `gemini-3.5-flash-lite`), remembered for 10 min; the trace and PR summary say which model answered |
+| every model down | the step is done by **deterministic rules** instead; PR labelled `fr:rules-only` and the summary says so. Tests, lint, risk rules and the injection scanner still run |
+| bad model key / refused request | config error: `FAILED_SAFE` + summary comment (needs a human) |
 | model returns messy JSON | normalised (synonyms, truncation, bad comments dropped one by one); if still invalid, one repair attempt, then `FAILED_SAFE` |
 | model key wrong / model retired | clear error naming the fix (`fr doctor`), `FAILED_SAFE` + summary comment |
 | Docker not running / image missing | `FAILED_SAFE` with the fix; never reported as "the PR's tests failed" |

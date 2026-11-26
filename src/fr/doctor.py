@@ -76,11 +76,11 @@ async def run_doctor(s: Settings) -> int:
         gh = GitHub(s.github_token, s.github_repo)
         try:
             info = await gh.repo_info()
-            perms = info.get("permissions") or {}
-            detail = (f"{info.get('full_name')} · default branch '{info.get('default_branch')}' · "
-                      f"{'private' if info.get('private') else 'public'}")
-            add(OK if perms.get("push", True) else FAIL, "github repo",
-                detail if perms.get("push", True) else detail + " · token cannot push")
+            add(OK, "github repo", f"{info.get('full_name')} · "
+                f"{'private' if info.get('private') else 'public'} · readable with this token")
+            # Reading a public repo proves little: a read-only token passes that. Prove write access.
+            ok, detail = await gh.can_push()
+            add(OK if ok else FAIL, "github token can write", detail)
         except GitHubError as e:
             add(FAIL, "github repo", str(e)[:200])
         finally:
